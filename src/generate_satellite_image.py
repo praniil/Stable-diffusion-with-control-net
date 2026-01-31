@@ -17,18 +17,20 @@ Usage:
 
 import os
 import sys
+import cv2
 import torch
 import numpy as np
 from pathlib import Path
 from PIL import Image
 import argparse
-from typing import Tuple, Dict, Optional, List
+from typing import Tuple, Dict, Optional, List, Union
 from datetime import datetime
 
 from diffusers import (
     StableDiffusionControlNetInpaintPipeline,
     ControlNetModel,
-    UniPCMultistepScheduler,
+    MultiControlNetModel,
+    DPMSolverMultistepScheduler,
 )
 
 # Import compute_coverage from the same directory
@@ -38,28 +40,44 @@ from compute_coverage import compute_coverage
 # =============================================================================
 # SET YOUR IMAGE PATHS HERE (change these as needed)
 # =============================================================================
-DEFAULT_IMAGE_PATH = "../dataset/Annotation/annotated_images/output_337.png"
-DEFAULT_MASK_PATH = "../dataset/Annotation/annotated_masks/output_337.png"
+DEFAULT_IMAGE_PATH = "../dataset/images/output_337.png"
+DEFAULT_MASK_PATH = "../dataset/masks/output_337.png"
 # =============================================================================
 
 
 # =============================================================================
-# CONFIGURATION - Segmentation Class Colors (RGB)
+# CONFIGURATION - BGR Label Mapping (canonical, matches user's format)
+# Label ID -> Class name; BGR colors for mask matching (OpenCV convention)
 # =============================================================================
-CLASS_COLORS = {
-    "River": (128, 0, 0),              # Red - IMMUTABLE
-    "Residential Area": (0, 0, 128),   # Dark Blue - EDITABLE
-    "Road": (0, 128, 0),               # Green - IMMUTABLE
-    "Forest": (128, 128, 0),           # Yellow - IMMUTABLE
-    "Unused Land": (0, 128, 128),      # Cyan - EDITABLE
-    "Agricultural Area": (128, 0, 128), # Magenta - IMMUTABLE
+LABEL_IDS = {
+    1: "Residential Area",   # (128, 0, 0) BGR
+    2: "Road",               # (0, 128, 0) BGR
+    3: "River",              # (0, 0, 128) BGR
+    4: "Forest",             # (0, 128, 128) BGR
+    5: "Unused Land",        # (128, 128, 0) BGR
+    6: "Agricultural Area",  # (128, 0, 128) BGR
 }
 
-# Classes that can be modified during generation
-EDITABLE_CLASSES = ["Residential Area", "Unused Land"]
+# BGR colors per label (exact mapping from user's conversion script)
+BGR_COLORS = {
+    1: (128, 0, 0),    # Residential_area
+    2: (0, 128, 0),    # Road
+    3: (0, 0, 128),    # River
+    4: (0, 128, 128),  # Forest
+    5: (128, 128, 0),  # unused_land
+    6: (128, 0, 128),  # Agricultural_area
+}
 
-# Classes that must remain unchanged
-IMMUTABLE_CLASSES = ["Road", "River", "Forest", "Agricultural Area"]
+CLASS_COLORS_BGR = {LABEL_IDS[i]: BGR_COLORS[i] for i in range(1, 7)}
+
+# RGB for display/compute_spatial_metrics (BGR -> RGB: swap R and B)
+CLASS_COLORS = {name: (bgr[2], bgr[1], bgr[0]) for name, bgr in CLASS_COLORS_BGR.items()}
+
+# Classes that can be modified during generation (planned city transformation)
+EDITABLE_CLASSES = ["Residential Area", "Unused Land", "Agricultural Area"]
+
+# Classes that must remain unchanged (preserved exactly)
+IMMUTABLE_CLASSES = ["Road", "River", "Forest"]
 
 
 # =============================================================================
@@ -81,41 +99,36 @@ def compute_connected_components(binary_mask: np.ndarray) -> Tuple[np.ndarray, i
     return labeled, num_features
 
 
-def compute_spatial_metrics(seg_mask: Image.Image, class_colors: Dict) -> Dict:
+def compute_spatial_metrics(
+    seg_mask: Optional[Image.Image] = None,
+    class_colors: Optional[Dict] = None,
+    label_mask: Optional[np.ndarray] = None,
+) -> Dict:
     """
     Compute spatial metrics from the segmentation mask for evidence-based analysis.
-    
-    Metrics computed:
-    - Connected components per class
-    - Average and median block sizes
-    - Fragmentation index
-    - Adjacency relationships
-    - Compactness measures
-    
-    Args:
-        seg_mask: Color-coded segmentation mask (PIL Image)
-        class_colors: Dictionary mapping class names to RGB tuples
-        
-    Returns:
-        Dictionary containing all spatial metrics
+    Accepts either (seg_mask, class_colors) for color masks or label_mask for single-channel.
     """
-    mask_array = np.array(seg_mask)
-    h, w = mask_array.shape[:2]
+    if label_mask is not None:
+        h, w = label_mask.shape[:2]
+        class_masks = create_class_masks_from_label_mask(label_mask)
+    elif seg_mask is not None and class_colors is not None:
+        mask_array = np.array(seg_mask)
+        h, w = mask_array.shape[:2]
+        class_masks = {}
+        for class_name, color in class_colors.items():
+            color_array = np.array(color)
+            matches = np.all(mask_array == color_array, axis=-1)
+            class_masks[class_name] = matches.astype(np.uint8)
+    else:
+        raise ValueError("Provide either (seg_mask, class_colors) or label_mask")
+
     total_pixels = h * w
-    
     metrics = {
         "image_dimensions": {"height": h, "width": w, "total_pixels": total_pixels},
         "class_metrics": {},
         "adjacency": {},
         "fragmentation": {},
     }
-    
-    # Create binary masks for each class
-    class_masks = {}
-    for class_name, color in class_colors.items():
-        color_array = np.array(color)
-        matches = np.all(mask_array == color_array, axis=-1)
-        class_masks[class_name] = matches.astype(np.uint8)
     
     # Compute per-class spatial metrics
     for class_name, binary_mask in class_masks.items():
@@ -469,12 +482,7 @@ def generate_suggestions(analysis: Dict) -> Dict:
             "coverage": coverage.get("Forest", 0),
             "rationale": "Forest areas provide ecological services and carbon sequestration"
         })
-    if coverage.get("Agricultural Area", 0) > 0:
-        suggestions["constraints"].append({
-            "class": "Agricultural Area",
-            "coverage": coverage.get("Agricultural Area", 0),
-            "rationale": "Agricultural land supports food production capacity"
-        })
+    # Note: Agricultural Area is EDITABLE (modern precision agriculture)
     
     # --- Issue-Driven Interventions ---
     for issue in issues:
@@ -751,13 +759,15 @@ The following regions will be preserved unchanged during visualization:
 
 | Class | Coverage (%) | Modification Scope |
 |-------|--------------|-------------------|
-| Residential Area | {analysis['coverage'].get('Residential Area', 0):.2f} | Smart city visualization |
-| Unused Land | {analysis['coverage'].get('Unused Land', 0):.2f} | Development visualization |
+| Residential Area | {analysis['coverage'].get('Residential Area', 0):.2f} | Planned residential, smart city |
+| Unused Land | {analysis['coverage'].get('Unused Land', 0):.2f} | Parks, lakes, green spaces |
+| Agricultural Area | {analysis['coverage'].get('Agricultural Area', 0):.2f} | Modern precision agriculture |
 
 ---
 
 ## Technical Notes
 
+- **Mask usage:** The segmentation mask defines (1) inpainting regions (white=editable: Residential, Unused, Agricultural—these are regenerated), (2) immutable regions (River, Road, Forest—preserved exactly via compositing). ControlNet uses Canny edges from the input image for structure guidance.
 - All metrics are computed from the segmentation mask prior to any image generation
 - Spatial indicators use 8-connectivity for connected component analysis
 - Fragmentation index = 1 - (largest_component / total_class_area)
@@ -781,78 +791,225 @@ End of Report
 # PART 3: CONSTRAINED IMAGE GENERATION
 # =============================================================================
 
+def color_mask_to_label_mask(mask_bgr: np.ndarray) -> np.ndarray:
+    """
+    Convert BGR color mask to single-channel label mask.
+    Uses canonical BGR mapping: label 1-6 per class.
+    """
+    h, w = mask_bgr.shape[:2]
+    label_mask = np.zeros((h, w), dtype=np.uint8)
+    for label_id, bgr in BGR_COLORS.items():
+        matches = np.all(mask_bgr == np.array(bgr), axis=-1)
+        label_mask[matches] = label_id
+    return label_mask
+
+
+def create_class_masks_from_label_mask(label_mask: np.ndarray) -> Dict[str, np.ndarray]:
+    """Create binary masks per class from single-channel label mask."""
+    class_masks = {}
+    for label_id, class_name in LABEL_IDS.items():
+        class_masks[class_name] = (label_mask == label_id).astype(np.uint8)
+    return class_masks
+
+
 def load_image_and_mask(
     image_path: str,
     mask_path: str,
     size: Tuple[int, int] = (512, 512)
-) -> Tuple[Image.Image, Image.Image]:
+) -> Tuple[Image.Image, Image.Image, np.ndarray]:
     """
     Load and resize the original satellite image and its segmentation mask.
+    Returns (original_image, seg_mask_pil, label_mask).
+    Supports both color mask (3ch) and single-channel label mask (1ch).
+    Color masks use BGR format for conversion to label mask.
     """
     original_image = Image.open(image_path).convert("RGB")
     original_image = original_image.resize(size, Image.Resampling.LANCZOS)
-    
-    seg_mask = Image.open(mask_path).convert("RGB")
-    seg_mask = seg_mask.resize(size, Image.Resampling.NEAREST)
-    
-    return original_image, seg_mask
+
+    mask_raw = cv2.imread(str(mask_path))
+    if mask_raw is None:
+        raise FileNotFoundError(f"Could not load mask: {mask_path}")
+
+    if len(mask_raw.shape) == 2:
+        # Already single-channel label mask
+        label_mask = cv2.resize(mask_raw, size, interpolation=cv2.INTER_NEAREST)
+        seg_mask_pil = Image.fromarray(label_mask, mode="L").convert("RGB")
+    else:
+        # Color mask (BGR) - convert to label mask
+        mask_bgr = cv2.resize(mask_raw, size, interpolation=cv2.INTER_NEAREST)
+        label_mask = color_mask_to_label_mask(mask_bgr)
+        seg_mask_pil = Image.fromarray(cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2RGB))
+
+    return original_image, seg_mask_pil, label_mask
 
 
-def create_class_masks(
-    seg_mask: Image.Image,
-    class_colors: Dict[str, Tuple[int, int, int]]
-) -> Dict[str, np.ndarray]:
-    """Create binary masks for each segmentation class."""
-    mask_array = np.array(seg_mask)
-    class_masks = {}
-    
-    for class_name, color in class_colors.items():
-        color_array = np.array(color)
-        matches = np.all(mask_array == color_array, axis=-1)
-        class_masks[class_name] = matches.astype(np.uint8)
-    
-    return class_masks
+def create_class_masks(label_mask: np.ndarray) -> Dict[str, np.ndarray]:
+    """Create binary masks for each segmentation class from label mask."""
+    return create_class_masks_from_label_mask(label_mask)
 
 
 def create_inpainting_mask(
     class_masks: Dict[str, np.ndarray],
-    editable_classes: List[str]
+    editable_classes: List[str],
+    boundary_erosion_pixels: int = 2,
 ) -> Image.Image:
     """
     Create inpainting mask from editable class regions.
     White (255) = regions to regenerate, Black (0) = regions to preserve.
+    Erodes editable regions at boundaries to reduce diffusion bleeding into immutables.
     """
+    from scipy import ndimage
+    
     h, w = list(class_masks.values())[0].shape
-    inpaint_mask = np.zeros((h, w), dtype=np.uint8)
+    editable_binary = np.zeros((h, w), dtype=np.uint8)
     
     for class_name in editable_classes:
         if class_name in class_masks:
-            inpaint_mask = np.maximum(inpaint_mask, class_masks[class_name] * 255)
+            editable_binary = np.maximum(editable_binary, class_masks[class_name])
     
+    if boundary_erosion_pixels > 0 and np.sum(editable_binary) > 0:
+        editable_binary = ndimage.binary_erosion(
+            editable_binary, iterations=boundary_erosion_pixels
+        ).astype(np.uint8)
+    
+    inpaint_mask = editable_binary * 255
     return Image.fromarray(inpaint_mask, mode="L")
 
 
-def prepare_controlnet_input(seg_mask: Image.Image) -> Image.Image:
-    """Prepare segmentation mask as ControlNet conditioning input."""
-    return seg_mask
+def create_immutable_mask(
+    class_masks: Dict[str, np.ndarray],
+    immutable_classes: List[str]
+) -> np.ndarray:
+    """
+    Create binary mask for immutable regions (River, Road, Forest).
+    Used for strict compositing to guarantee original pixels are preserved.
+    """
+    h, w = list(class_masks.values())[0].shape
+    immutable_mask = np.zeros((h, w), dtype=np.uint8)
+    
+    for class_name in immutable_classes:
+        if class_name in class_masks:
+            immutable_mask = np.maximum(immutable_mask, class_masks[class_name])
+    
+    return immutable_mask
+
+
+# ADE20K palette for Segmentation ControlNet (lllyasviel/control_v11p_sd15_seg)
+# Maps our label IDs to ADE20K-compatible colors: building, road, water, tree, grass, field
+ADE20K_PALETTE = np.array([
+    [0, 0, 0], [120, 120, 120], [180, 120, 120], [6, 230, 230], [80, 50, 50],
+    [4, 200, 3], [120, 120, 80], [140, 140, 140], [204, 5, 255], [230, 230, 230],
+    [4, 250, 7], [224, 5, 255], [235, 255, 7], [150, 5, 61], [120, 120, 70],
+    [8, 255, 51], [255, 6, 82], [143, 255, 140], [204, 255, 4], [255, 51, 7],
+    [204, 70, 3], [0, 102, 200], [61, 230, 250], [255, 6, 51], [11, 102, 255],
+    [255, 7, 71], [255, 9, 224], [9, 7, 230], [220, 220, 220], [255, 9, 92],
+    [112, 9, 255], [8, 255, 214], [7, 255, 224], [255, 184, 6], [10, 255, 71],
+    [255, 41, 10], [7, 255, 255], [224, 255, 8], [102, 8, 255], [255, 61, 6],
+    [255, 194, 7], [255, 122, 8], [0, 255, 20], [255, 8, 41], [255, 5, 153],
+], dtype=np.uint8)
+
+# Our label_id -> ADE20K palette index (building=1, road=6, water=21, tree=5, grass=10, field=12)
+LABEL_TO_ADE20K_IDX = {
+    1: 1,   # Residential Area -> building (gray)
+    2: 6,   # Road -> road (olive)
+    3: 21,  # River -> water (blue)
+    4: 5,   # Forest -> tree (green)
+    5: 10,  # Unused Land -> grass (bright green)
+    6: 12,  # Agricultural Area -> field (yellow-green)
+}
+
+
+def create_seg_control_image(label_mask: np.ndarray) -> Image.Image:
+    """
+    Create ADE20K-compatible segmentation control image for ControlNet.
+    Maps our 6 land-use classes to ADE20K palette colors.
+    """
+    h, w = label_mask.shape[:2]
+    color_seg = np.zeros((h, w, 3), dtype=np.uint8)
+    for label_id, ada_idx in LABEL_TO_ADE20K_IDX.items():
+        mask = (label_mask == label_id)
+        color_seg[mask] = ADE20K_PALETTE[ada_idx]
+    return Image.fromarray(color_seg)
+
+
+def extract_canny_edges(
+    image: Image.Image,
+    low_threshold: int = 50,
+    high_threshold: int = 120
+) -> Image.Image:
+    """
+    Extract Canny edges from the original satellite image for ControlNet conditioning.
+    Preserves roads, rivers, building outlines, and field boundaries from the real image.
+    Returns white-on-black edge map (required by Canny ControlNet).
+    """
+    img_array = np.array(image)
+    if len(img_array.shape) == 3:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_array
+    edges = cv2.Canny(gray, low_threshold, high_threshold)
+    return Image.fromarray(edges, mode="L").convert("RGB")
+
+
+def extract_depth_image(image: Image.Image, resolution: int = 512) -> Image.Image:
+    """
+    Estimate depth from image using controlnet-aux MidasDetector.
+    Returns grayscale depth map (3ch) for Depth ControlNet.
+    """
+    try:
+        from controlnet_aux import MidasDetector
+        detector = MidasDetector.from_pretrained("lllyasviel/ControlNet")
+        depth = detector(image, detect_resolution=resolution, image_resolution=resolution)
+        return depth if isinstance(depth, Image.Image) else Image.fromarray(depth)
+    except Exception as e:
+        raise RuntimeError(f"Failed to extract depth (install controlnet-aux): {e}") from e
 
 
 class SmartCitySatelliteGenerator:
     """
-    Generator for smart city satellite images using ControlNet + SD Inpainting.
+    Generator for smart city satellite images using ControlNet + SD Inpainting + IP-Adapter.
+    Supports multi-ControlNet: Canny + Segmentation + optional Depth.
     """
     
-    def __init__(self, device: str = None):
+    def __init__(
+        self,
+        device: str = None,
+        use_ip_adapter: bool = False,
+        low_vram: bool = False,
+        use_seg_control: bool = True,
+        use_depth_control: bool = False,
+    ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+        self.use_ip_adapter = use_ip_adapter
+        self.low_vram = low_vram
+        self.use_seg_control = use_seg_control
+        self.use_depth_control = use_depth_control
         
-        print(f"Initializing Smart City Generator on {self.device}...")
+        print(f"Initializing Smart City Generator on {self.device}"
+              + (" (low VRAM mode)" if low_vram else "") + "...")
         
-        print("Loading ControlNet (segmentation)...")
-        self.controlnet = ControlNetModel.from_pretrained(
-            "lllyasviel/control_v11p_sd15_seg",
+        print("Loading ControlNet (Canny edges)...")
+        controlnets = [ControlNetModel.from_pretrained(
+            "lllyasviel/control_v11p_sd15_canny",
             torch_dtype=self.dtype
-        )
+        )]
+        
+        if use_seg_control:
+            print("Loading ControlNet (Segmentation)...")
+            controlnets.append(ControlNetModel.from_pretrained(
+                "lllyasviel/control_v11p_sd15_seg",
+                torch_dtype=self.dtype
+            ))
+        
+        if use_depth_control:
+            print("Loading ControlNet (Depth)...")
+            controlnets.append(ControlNetModel.from_pretrained(
+                "lllyasviel/control_v11f1p_sd15_depth",
+                torch_dtype=self.dtype
+            ))
+        
+        self.controlnet = MultiControlNetModel(controlnets) if len(controlnets) > 1 else controlnets[0]
         
         print("Loading Stable Diffusion Inpainting pipeline...")
         self.pipeline = StableDiffusionControlNetInpaintPipeline.from_pretrained(
@@ -862,80 +1019,184 @@ class SmartCitySatelliteGenerator:
             safety_checker=None,
         )
         
-        self.pipeline.scheduler = UniPCMultistepScheduler.from_config(
-            self.pipeline.scheduler.config
+        self.pipeline.scheduler = DPMSolverMultistepScheduler.from_config(
+            self.pipeline.scheduler.config,
+            use_karras_sigmas=True,
+            algorithm_type="dpmsolver++",
         )
+        
+        if use_ip_adapter:
+            try:
+                print("Loading IP-Adapter for texture/lighting consistency...")
+                self.pipeline.load_ip_adapter(
+                    "h94/IP-Adapter",
+                    subfolder="models",
+                    weight_name="ip-adapter_sd15.bin"
+                )
+                print("IP-Adapter loaded successfully")
+            except Exception as e:
+                print(f"Warning: Could not load IP-Adapter ({e}). Proceeding without style reference.")
+                self.use_ip_adapter = False
         
         if self.device == "cuda":
             self.pipeline.enable_attention_slicing()
-            try:
-                self.pipeline.enable_xformers_memory_efficient_attention()
-                print("xformers memory efficient attention enabled")
-            except Exception:
-                print("xformers not available, using standard attention")
+            # Skip xformers when using IP-Adapter (known compatibility: tuple/shape error)
+            if not self.use_ip_adapter:
+                try:
+                    self.pipeline.enable_xformers_memory_efficient_attention()
+                    print("xformers memory efficient attention enabled")
+                except Exception:
+                    print("xformers not available, using standard attention")
         
-        self.pipeline = self.pipeline.to(self.device)
+        if low_vram and self.device == "cuda":
+            print("Enabling model CPU offload for low VRAM GPUs...")
+            self.pipeline.enable_model_cpu_offload()
+        else:
+            self.pipeline = self.pipeline.to(self.device)
         print("Generator ready!\n")
     
     def generate_smart_city_image(
         self,
         original_image: Image.Image,
-        control_image: Image.Image,
+        control_image: Union[Image.Image, List[Image.Image]],
         inpaint_mask: Image.Image,
         prompt: str,
         negative_prompt: str = "",
-        num_inference_steps: int = 30,
-        guidance_scale: float = 7.5,
-        controlnet_conditioning_scale: float = 0.8,
+        num_inference_steps: int = 35,
+        guidance_scale: float = 7.0,
+        controlnet_conditioning_scale: Union[float, List[float], None] = None,
+        ip_adapter_scale: float = 0.6,
+        strength: float = 0.60,
         seed: Optional[int] = None,
     ) -> Image.Image:
-        """Generate a smart city satellite image using inpainting with ControlNet."""
+        """Generate a smart city satellite image using inpainting with ControlNet(s) and optional IP-Adapter.
+        control_image: single image (Canny only) or list [canny, seg, depth] for multi-ControlNet.
+        controlnet_conditioning_scale: float or list matching number of ControlNets.
+        """
+        if controlnet_conditioning_scale is None:
+            scales = [0.8]  # Canny
+            if self.use_seg_control:
+                scales.append(1.0)
+            if self.use_depth_control:
+                scales.append(0.7)
+            controlnet_conditioning_scale = scales[0] if len(scales) == 1 else scales
+
+        # With CPU offload, generator device must be "cpu" for correct placement
+        gen_device = "cpu" if self.low_vram else self.device
         generator = None
         if seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(seed)
+            generator = torch.Generator(device=gen_device).manual_seed(seed)
             print(f"Using seed: {seed}")
         
+        if self.use_ip_adapter:
+            self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
+        
         print(f"Generating with prompt: '{prompt[:80]}...'")
-        print(f"Steps: {num_inference_steps}, Guidance: {guidance_scale}, "
-              f"ControlNet scale: {controlnet_conditioning_scale}")
+        print(f"Steps: {num_inference_steps}, Strength: {strength}, Guidance: {guidance_scale}, "
+              f"ControlNet scale: {controlnet_conditioning_scale}"
+              + (f", IP-Adapter scale: {ip_adapter_scale}" if self.use_ip_adapter else ""))
+        
+        pipeline_kwargs = dict(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=original_image,
+            mask_image=inpaint_mask,
+            control_image=control_image,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            controlnet_conditioning_scale=controlnet_conditioning_scale,
+            strength=strength,
+            generator=generator,
+            height=original_image.height,
+            width=original_image.width,
+        )
+        if self.use_ip_adapter:
+            pipeline_kwargs["ip_adapter_image"] = original_image
         
         with torch.no_grad():
-            result = self.pipeline(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=original_image,
-                mask_image=inpaint_mask,
-                control_image=control_image,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                controlnet_conditioning_scale=controlnet_conditioning_scale,
-                generator=generator,
-                height=original_image.height,
-                width=original_image.width,
-            )
+            result = self.pipeline(**pipeline_kwargs)
         
         return result.images[0]
+
+
+def denoise_generated_regions(
+    generated_image: Image.Image,
+    inpaint_mask: Image.Image,
+    strength: float = 0.3,
+    d: int = 5,
+    sigma_color: float = 50,
+    sigma_space: float = 50,
+) -> Image.Image:
+    """
+    Apply light bilateral denoising to generated regions only.
+    Preserves edges while reducing flat-area noise. Strength controls blend
+    between original and filtered (0=no change, 1=fully filtered).
+    """
+    gen_array = np.array(generated_image)
+    mask_array = np.array(inpaint_mask)
+    editable = (mask_array > 0).astype(np.float32)
+    if np.sum(editable) == 0:
+        return generated_image
+
+    filtered = cv2.bilateralFilter(gen_array, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+    # Blend: strength * filtered + (1-strength) * original in editable regions
+    blend = (strength * filtered + (1 - strength) * gen_array).astype(np.float32)
+    editable_3ch = np.stack([editable] * 3, axis=-1)
+    result = gen_array.astype(np.float32) * (1 - editable_3ch) + blend * editable_3ch
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    return Image.fromarray(result)
+
+
+def sharpen_generated_regions(
+    generated_image: Image.Image,
+    inpaint_mask: Image.Image,
+    amount: float = 0.3,
+    radius: float = 1.0,
+    threshold: int = 0,
+) -> Image.Image:
+    """
+    Apply unsharp mask to generated regions only for high-frequency detail.
+    """
+    from PIL import ImageFilter
+    gen_array = np.array(generated_image)
+    mask_array = np.array(inpaint_mask)
+    editable = (mask_array > 0).astype(np.float32)
+    if np.sum(editable) == 0:
+        return generated_image
+    sharpened = generated_image.filter(
+        ImageFilter.UnsharpMask(radius=radius, percent=int(100 + amount * 100), threshold=threshold)
+    )
+    sharp_array = np.array(sharpened)
+    editable_3ch = np.stack([editable] * 3, axis=-1)
+    result = gen_array.astype(np.float32) * (1 - editable_3ch) + sharp_array.astype(np.float32) * editable_3ch
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    return Image.fromarray(result)
 
 
 def composite_with_original(
     generated_image: Image.Image,
     original_image: Image.Image,
-    inpaint_mask: Image.Image
+    inpaint_mask: Image.Image,
+    immutable_mask: Optional[np.ndarray] = None,
 ) -> Image.Image:
     """
     Composite generated image with original, ensuring immutable regions
-    are preserved exactly at the pixel level.
+    (River, Road, Forest) are preserved exactly at the pixel level.
+    Uses explicit immutable mask when provided; preserve = immutable OR not-editable.
     """
     gen_array = np.array(generated_image)
     orig_array = np.array(original_image)
     mask_array = np.array(inpaint_mask)
     
-    mask_float = mask_array.astype(np.float32) / 255.0
-    mask_3ch = np.stack([mask_float] * 3, axis=-1)
+    # Where to use original: immutable pixels OR pixels not in editable (inpaint) region
+    if immutable_mask is not None and np.sum(immutable_mask) > 0:
+        preserve = ((immutable_mask > 0) | (mask_array == 0)).astype(np.float32)
+    else:
+        preserve = (mask_array == 0).astype(np.float32)
     
-    result = gen_array * mask_3ch + orig_array * (1 - mask_3ch)
+    preserve_3ch = np.stack([preserve] * 3, axis=-1)
+    result = gen_array * (1 - preserve_3ch) + orig_array * preserve_3ch
     result = result.astype(np.uint8)
-    
     return Image.fromarray(result)
 
 
@@ -947,7 +1208,8 @@ def validate_and_log_results(
     original_mask_path: str,
     generated_image: Image.Image,
     original_coverage: Dict[str, float],
-    output_dir: str
+    output_dir: str,
+    validation_path: Optional[str] = None,
 ) -> Dict:
     """
     Validate that immutable regions were preserved.
@@ -985,16 +1247,15 @@ def validate_and_log_results(
 - Road: {original_coverage.get('Road', 0):.2f}% ✓
 - River: {original_coverage.get('River', 0):.2f}% ✓
 - Forest: {original_coverage.get('Forest', 0):.2f}% ✓
-- Agricultural Area: {original_coverage.get('Agricultural Area', 0):.2f}% ✓
 
 **Validation Status:** PASSED
 """
     
-    validation_path = os.path.join(output_dir, "validation_results.md")
-    with open(validation_path, "w") as f:
+    val_path = validation_path or os.path.join(output_dir, "validation_results.md")
+    with open(val_path, "w") as f:
         f.write(validation_log)
     
-    print(f"✓ Validation results saved: {validation_path}")
+    print(f"✓ Validation results saved: {val_path}")
     
     return validation
 
@@ -1003,22 +1264,59 @@ def validate_and_log_results(
 # PROMPT CONFIGURATION
 # =============================================================================
 
-DEFAULT_PROMPT = """
-Aerial satellite view of a modern smart city district,
-sustainable urban development, organized residential blocks,
-green rooftops, solar panels, high-resolution satellite imagery,
-top-down orthographic view, realistic urban planning,
-smart infrastructure, clean streets, well-maintained buildings
-""".strip().replace("\n", " ")
+# Planning-informed descriptors per editable class (concise for CLIP 77-token limit)
+CLASS_PROMPTS = {
+    "Residential Area": (
+        "planned neighborhood, street grid, roads between blocks, spacing between houses, "
+        "small parks and green pockets, tree-lined streets, organized housing layout, green rooftops"
+    ),
+    "Unused Land": (
+        "parks, recreational areas, playgrounds, sports fields, walking paths, "
+        "green space, community garden, urban park"
+    ),
+    "Agricultural Area": (
+        "modern precision agriculture, organized crop fields, greenhouses, "
+        "structured farm layout, irrigation patterns"
+    ),
+}
 
-DEFAULT_NEGATIVE_PROMPT = """
-clouds, cloud cover, fog, haze, atmospheric effects,
-new roads, altered roads, modified river paths,
-industrial buildings, factories, heavy infrastructure,
-fantasy style, artistic style, painting, illustration,
-distorted geometry, unrealistic colors, blurry,
-low quality, watermark, text, cartoon
-""".strip().replace("\n", " ")
+
+def build_smart_city_prompt(coverage: Dict[str, float], base_prompt: str) -> str:
+    """
+    Build class-aware prompt from coverage using planning-informed descriptors.
+    Kept under ~70 tokens for CLIP's 77-token limit.
+    """
+    parts = [base_prompt]
+    for class_name in EDITABLE_CLASSES:
+        if coverage.get(class_name, 0) > 0 and class_name in CLASS_PROMPTS:
+            parts.append(CLASS_PROMPTS[class_name])
+    prompt = ", ".join(parts)
+    if len(prompt) > 280:
+        prompt = prompt[:277] + "..."
+    return prompt
+
+
+DEFAULT_PROMPT = (
+    "high-resolution satellite aerial image, orthographic view, "
+    "realistic rooftops, agricultural parcels, forest canopy texture, "
+    "clear road networks, geographic consistency, "
+    "clear sky, no clouds, photorealistic, sharp focus"
+)
+
+DEFAULT_NEGATIVE_PROMPT = (
+    "abstract, painting, brush strokes, distorted, melted, surreal, texture hallucination, "
+    "clouds, cloud cover, cloudy, overcast, fog, haze, mist, atmospheric effects, "
+    "cloud shadows, cumulus, stratus, cirrus, weather, "
+    "grainy, noisy, blurry, artifacts, low resolution, "
+    "watercolor, painted, soft edges, smudged, amorphous shapes, "
+    "new roads, altered roads, modified river paths, "
+    "industrial buildings, factories, heavy infrastructure, "
+    "fantasy style, artistic style, painting, illustration, "
+    "distorted geometry, unrealistic colors, blurry, "
+    "low quality, watermark, text, cartoon, "
+    "informal settlement, unplanned sprawl, cramped housing, no spacing, dense slum, "
+    "overgrown vacant lot, barren land"
+)
 
 
 # =============================================================================
@@ -1031,6 +1329,161 @@ def get_project_root() -> Path:
     if script_dir.name == "src":
         return script_dir.parent
     return script_dir
+
+
+def process_single_pair(
+    image_path: str,
+    mask_path: str,
+    output_path: str,
+    args,
+    script_dir: str,
+    project_root: Path,
+    verbose: bool = True,
+) -> bool:
+    """
+    Process a single image-mask pair: analysis, report, generation, validation.
+    Returns True on success, False on failure.
+    """
+    def log(msg: str):
+        if verbose:
+            print(msg)
+
+    output_dir = os.path.dirname(output_path) or str(project_root / "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    if verbose:
+        print(f"\nProcessing: {os.path.basename(image_path)}")
+
+    # PART 1: Spatial Analysis
+    _, seg_mask_for_analysis, label_mask_for_analysis = load_image_and_mask(
+        image_path, mask_path, size=(args.size, args.size)
+    )
+    coverage = compute_coverage(mask_path)
+
+    if verbose:
+        log("\n   Coverage Results:")
+        for class_name, pct in sorted(coverage.items(), key=lambda x: -x[1]):
+            if pct > 0:
+                status = "Editable" if class_name in EDITABLE_CLASSES else "Immutable"
+                log(f"   - {class_name}: {pct:.2f}% ({status})")
+
+    spatial_metrics = compute_spatial_metrics(label_mask=label_mask_for_analysis)
+    analysis = analyze_urban_layout(coverage, spatial_metrics)
+    suggestions = generate_suggestions(analysis)
+
+    # PART 2: Report (only when analysis-only; otherwise output dir stays clean)
+    if args.analysis_only:
+        if verbose:
+            log("\n" + "=" * 70)
+            log("PART 2: REPORT GENERATION")
+            log("=" * 70)
+        report_path = os.path.join(output_dir, f"{Path(output_path).stem}_report.md")
+        create_report(image_path, mask_path, analysis, suggestions, report_path)
+        if verbose:
+            log(f"   Report saved: {report_path}")
+
+    if args.analysis_only:
+        return True
+
+    # PART 3: Generation
+    if verbose:
+        log("\n" + "=" * 70)
+        log("PART 3: CONSTRAINED IMAGE GENERATION")
+        log("=" * 70)
+        log("\n[1/5] Loading image and segmentation mask...")
+        log("[2/5] Creating class masks...")
+        log("[3/5] Creating inpainting mask and immutable mask...")
+        log("[4/5] Extracting Canny edges...")
+        log("[5/5] Generating smart city satellite image...")
+    original_image, seg_mask, label_mask = load_image_and_mask(
+        image_path, mask_path, size=(args.size, args.size)
+    )
+    class_masks = create_class_masks(label_mask)
+    inpaint_mask = create_inpainting_mask(class_masks, EDITABLE_CLASSES)
+    immutable_mask = create_immutable_mask(class_masks, IMMUTABLE_CLASSES)
+
+    # Clean output: save only input, mask, and output
+    stem = Path(output_path).stem
+    input_save_path = os.path.join(output_dir, f"{stem}_input.png")
+    mask_save_path = os.path.join(output_dir, f"{stem}_mask.png")
+    original_image.save(input_save_path)
+    seg_mask.save(mask_save_path)
+    if verbose:
+        log(f"   Input saved: {input_save_path}")
+        log(f"   Mask saved: {mask_save_path}")
+
+    canny_image = extract_canny_edges(
+        original_image,
+        low_threshold=getattr(args, "canny_low", 50),
+        high_threshold=getattr(args, "canny_high", 120),
+    )
+    control_images = [canny_image]
+    control_scales = [getattr(args, "controlnet_scale", 0.8)]
+
+    if getattr(args, "no_seg_control", False):
+        if verbose:
+            log("   WARNING: Segmentation disabled - expect structural loss (roads, parcels may melt)")
+    else:
+        seg_image = create_seg_control_image(label_mask)
+        control_images.append(seg_image)
+        control_scales.append(getattr(args, "seg_scale", 1.0))
+
+    if getattr(args, "use_depth_control", False):
+        depth_image = extract_depth_image(original_image, resolution=args.size)
+        control_images.append(depth_image)
+        control_scales.append(getattr(args, "depth_scale", 0.7))
+
+    control_image = control_images[0] if len(control_images) == 1 else control_images
+    controlnet_scale = control_scales[0] if len(control_scales) == 1 else control_scales
+
+    prompt = build_smart_city_prompt(coverage, args.prompt)
+
+    generator = SmartCitySatelliteGenerator(
+        use_ip_adapter=args.use_ip_adapter,
+        low_vram=args.low_vram,
+        use_seg_control=not getattr(args, "no_seg_control", False),
+        use_depth_control=getattr(args, "use_depth_control", False),
+    )
+    generated_image = generator.generate_smart_city_image(
+        original_image=original_image,
+        control_image=control_image,
+        inpaint_mask=inpaint_mask,
+        prompt=prompt,
+        negative_prompt=args.negative_prompt,
+        num_inference_steps=args.steps,
+        guidance_scale=args.guidance_scale,
+        controlnet_conditioning_scale=controlnet_scale,
+        ip_adapter_scale=args.ip_adapter_scale,
+        strength=args.strength,
+        seed=args.seed,
+    )
+
+    if args.denoise:
+        generated_image = denoise_generated_regions(
+            generated_image, inpaint_mask, strength=args.denoise_strength
+        )
+        if verbose:
+            log("   Applied light denoising to generated regions")
+
+    if getattr(args, "sharpen", False):
+        generated_image = sharpen_generated_regions(
+            generated_image, inpaint_mask, amount=getattr(args, "sharpen_amount", 0.3)
+        )
+        if verbose:
+            log("   Applied sharpening to generated regions")
+
+    final_image = composite_with_original(
+        generated_image, original_image, inpaint_mask, immutable_mask
+    )
+
+    # Save output (ControlNet result)
+    output_save_path = os.path.join(output_dir, f"{stem}_output.png")
+    final_image.save(output_save_path)
+    if verbose:
+        log("\nCompositing with original (preserving immutable regions)...")
+        log(f"   Output saved: {output_save_path}")
+
+    return True
 
 
 def main():
@@ -1072,20 +1525,26 @@ def main():
     parser.add_argument(
         "--steps",
         type=int,
-        default=30,
+        default=35,
         help="Number of inference steps"
     )
     parser.add_argument(
         "--guidance_scale",
         type=float,
-        default=7.5,
-        help="Guidance scale"
+        default=7.0,
+        help="Guidance scale (6.5-8 for stability)"
     )
     parser.add_argument(
         "--controlnet_scale",
         type=float,
         default=0.8,
-        help="ControlNet conditioning scale"
+        help="Canny ControlNet conditioning scale"
+    )
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=0.60,
+        help="Inpainting strength (0.5-0.8). Lower preserves more input style; 1.0 fully regenerates"
     )
     parser.add_argument(
         "--seed",
@@ -1097,39 +1556,174 @@ def main():
         "--size",
         type=int,
         default=512,
-        help="Image size (width and height)"
+        help="Image size. 512 default (works on 4GB GPUs with --low_vram). 768 needs 8GB+ VRAM"
     )
     parser.add_argument(
         "--analysis_only",
         action="store_true",
         help="Only run analysis and generate report, skip image generation"
     )
+    parser.add_argument(
+        "--ip_adapter_scale",
+        type=float,
+        default=0.6,
+        help="IP-Adapter scale for style consistency (0.5-0.7 recommended)"
+    )
+    parser.add_argument(
+        "--use_ip_adapter",
+        action="store_true",
+        help="Enable IP-Adapter for texture/lighting consistency (experimental: may fail with ControlNet+inpainting)"
+    )
+    parser.add_argument(
+        "--low_vram",
+        action="store_true",
+        help="Use CPU offload for low VRAM GPUs (e.g. 4GB). Slower but works on small GPUs."
+    )
+    parser.add_argument(
+        "--denoise",
+        action="store_true",
+        help="Apply light bilateral denoising to generated regions to reduce noise"
+    )
+    parser.add_argument(
+        "--denoise_strength",
+        type=float,
+        default=0.3,
+        help="Denoise blend strength (0-1). Higher = more smoothing. Default 0.3"
+    )
+    parser.add_argument(
+        "--no_seg_control",
+        action="store_true",
+        help="Disable segmentation ControlNet (Canny only)"
+    )
+    parser.add_argument(
+        "--seg_scale",
+        type=float,
+        default=1.0,
+        help="Segmentation ControlNet weight (1.0 recommended for structural preservation)"
+    )
+    parser.add_argument(
+        "--use_depth_control",
+        action="store_true",
+        help="Enable depth ControlNet for lighting consistency (extra VRAM)"
+    )
+    parser.add_argument(
+        "--depth_scale",
+        type=float,
+        default=0.7,
+        help="Depth ControlNet weight"
+    )
+    parser.add_argument(
+        "--canny_low",
+        type=int,
+        default=50,
+        help="Canny edge detection low threshold"
+    )
+    parser.add_argument(
+        "--canny_high",
+        type=int,
+        default=120,
+        help="Canny edge detection high threshold"
+    )
+    parser.add_argument(
+        "--sharpen",
+        action="store_true",
+        help="Apply unsharp mask to generated regions"
+    )
+    parser.add_argument(
+        "--sharpen_amount",
+        type=float,
+        default=0.3,
+        help="Sharpen strength (0-1). Default 0.3"
+    )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Process all image-mask pairs in dataset directory"
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default=None,
+        help="Dataset directory with images/ and masks/ subdirs (default: project_root/dataset)"
+    )
     
     args = parser.parse_args()
-    
-    # Resolve relative paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    
+    output_dir = os.path.dirname(args.output) or str(project_root / "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    if args.batch:
+        # Batch mode: process all image-mask pairs in dataset
+        dataset_dir = args.dataset_dir or str(project_root / "dataset")
+        images_dir = os.path.join(dataset_dir, "images")
+        masks_dir = os.path.join(dataset_dir, "masks")
+
+        if not os.path.isdir(images_dir):
+            print(f"Error: Images directory not found: {images_dir}")
+            return
+        if not os.path.isdir(masks_dir):
+            print(f"Error: Masks directory not found: {masks_dir}")
+            return
+
+        image_extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tiff")
+        image_files = [
+            f for f in os.listdir(images_dir)
+            if f.lower().endswith(image_extensions)
+        ]
+
+        pairs = []
+        for img_file in sorted(image_files):
+            mask_path = os.path.join(masks_dir, img_file)
+            if os.path.exists(mask_path):
+                pairs.append((
+                    os.path.join(images_dir, img_file),
+                    mask_path,
+                ))
+            else:
+                print(f"Skipping {img_file}: no matching mask found")
+
+        print("=" * 70)
+        print("    BATCH PROCESSING")
+        print("=" * 70)
+        print(f"Dataset: {dataset_dir}")
+        print(f"Pairs found: {len(pairs)}")
+        print(f"Output dir: {output_dir}")
+        print("=" * 70)
+
+        for i, (image_path, mask_path) in enumerate(pairs):
+            stem = Path(image_path).stem
+            output_path = os.path.join(output_dir, f"generated_{stem}.png")
+            print(f"\n[{i + 1}/{len(pairs)}] {stem}")
+            try:
+                process_single_pair(
+                    image_path, mask_path, output_path,
+                    args, script_dir, project_root, verbose=True
+                )
+            except Exception as e:
+                print(f"   Error: {e}")
+                continue
+
+        print("\n" + "=" * 70)
+        print("    BATCH COMPLETE")
+        print("=" * 70)
+        print(f"Processed {len(pairs)} pairs. Outputs in {output_dir}/")
+        return
+
+    # Single-image mode
     image_path = args.image
     if not os.path.isabs(image_path):
         image_path = os.path.join(script_dir, image_path)
-    
     mask_path = args.mask
     if not os.path.isabs(mask_path):
         mask_path = os.path.join(script_dir, mask_path)
-    
-    # Validate inputs
+
     if not os.path.exists(image_path):
         print(f"Error: Image not found: {image_path}")
         return
     if not os.path.exists(mask_path):
         print(f"Error: Mask not found: {mask_path}")
         return
-    
-    # Create output directory
-    output_dir = os.path.dirname(args.output) or str(project_root / "output")
-    os.makedirs(output_dir, exist_ok=True)
-    
+
     print("=" * 70)
     print("    URBAN SPATIAL ANALYSIS AND SMART CITY VISUALIZATION")
     print("=" * 70)
@@ -1137,160 +1731,32 @@ def main():
     print(f"Mask:  {mask_path}")
     print(f"Output: {args.output}")
     print("=" * 70)
-    
-    # =========================================================================
-    # PART 1: SPATIAL ANALYSIS
-    # =========================================================================
     print("\n" + "=" * 70)
     print("PART 1: SPATIAL ANALYSIS")
     print("=" * 70)
-    
     print("\n[1/5] Loading segmentation mask for analysis...")
-    _, seg_mask_for_analysis = load_image_and_mask(
-        image_path, mask_path, size=(args.size, args.size)
-    )
-    
     print("[2/5] Computing area coverage...")
-    coverage = compute_coverage(mask_path)
-    
-    print("\n   Coverage Results:")
-    for class_name, pct in sorted(coverage.items(), key=lambda x: -x[1]):
-        if pct > 0:
-            status = "Editable" if class_name in EDITABLE_CLASSES else "Immutable"
-            print(f"   - {class_name}: {pct:.2f}% ({status})")
-    
-    print("\n[3/5] Computing spatial metrics (connected components, fragmentation, adjacency)...")
-    spatial_metrics = compute_spatial_metrics(seg_mask_for_analysis, CLASS_COLORS)
-    
-    # Print key spatial indicators
-    res_metrics = spatial_metrics.get("class_metrics", {}).get("Residential Area", {})
-    if res_metrics.get("pixel_count", 0) > 0:
-        print(f"\n   Residential Spatial Indicators:")
-        print(f"   - Components: {res_metrics.get('num_components', 0)}")
-        print(f"   - Compactness: {res_metrics.get('compactness', 'N/A')} (ratio: {res_metrics.get('compactness_ratio', 0):.3f})")
-        print(f"   - Largest block: {res_metrics.get('largest_component_percent', 0):.2f}% of image")
-    
-    frag = spatial_metrics.get("fragmentation", {}).get("Residential Area", {})
-    if frag:
-        print(f"   - Fragmentation: {frag.get('level', 'N/A')} (index: {frag.get('index', 0):.3f})")
-    
-    print("\n[4/5] Analyzing urban layout (evidence-based)...")
-    analysis = analyze_urban_layout(coverage, spatial_metrics)
-    
-    density = analysis.get("density_assessment", {})
-    open_space = analysis.get("open_space_assessment", {})
-    
-    print(f"\n   Density Classification: {density.get('classification', 'N/A')}")
-    if density.get("compactness"):
-        print(f"   Residential Compactness: {density.get('compactness')}")
-    print(f"   Open Space Accessibility: {open_space.get('accessibility', 'N/A')}")
-    
-    issues = analysis.get("issues", [])
-    if issues:
-        print(f"\n   Identified Issues ({len(issues)}):")
-        for issue in issues:
-            print(f"   - [{issue['severity']}] {issue['category']}")
+    print("[3/5] Computing spatial metrics...")
+    print("[4/5] Analyzing urban layout...")
+    print("[5/5] Generating suggestions...")
+
+    process_single_pair(
+        image_path, mask_path, args.output,
+        args, script_dir, project_root, verbose=True
+    )
+
+    if not args.analysis_only:
+        print("\n" + "=" * 70)
+        print("    PIPELINE COMPLETE")
+        print("=" * 70)
+        print(f"\nOutput saved to: {output_dir}/")
+        print("  - *_input.png   Your input image")
+        print("  - *_mask.png    Your segmentation mask")
+        print("  - *_output.png  ControlNet generation result")
     else:
-        print("\n   No significant issues detected.")
-    
-    print("\n[5/5] Generating evidence-linked suggestions...")
-    suggestions = generate_suggestions(analysis)
-    
-    interventions = suggestions.get("interventions", [])
-    if interventions:
-        print(f"\n   Interventions ({len(interventions)}):")
-        for inv in interventions[:3]:
-            print(f"   - {inv['linked_issue']}: {len(inv.get('recommendations', []))} recommendation(s)")
-    
-    # =========================================================================
-    # PART 2: REPORT GENERATION
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("PART 2: REPORT GENERATION")
-    print("=" * 70)
-    
-    print("\nCreating evidence-based analysis report...")
-    report_path = os.path.join(output_dir, "urban_analysis_report.md")
-    report = create_report(image_path, mask_path, analysis, suggestions, report_path)
-    print(f"Report saved: {report_path}")
-    
-    if args.analysis_only:
         print("\n" + "=" * 70)
         print("ANALYSIS COMPLETE (image generation skipped)")
         print("=" * 70)
-        return
-    
-    # =========================================================================
-    # PART 3: CONSTRAINED IMAGE GENERATION
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("PART 3: CONSTRAINED IMAGE GENERATION")
-    print("=" * 70)
-    
-    print("\n[1/5] Loading image and segmentation mask...")
-    original_image, seg_mask = load_image_and_mask(
-        image_path, mask_path, size=(args.size, args.size)
-    )
-    
-    print("[2/5] Creating class masks...")
-    class_masks = create_class_masks(seg_mask, CLASS_COLORS)
-    
-    print("[3/5] Creating inpainting mask (editable regions only)...")
-    inpaint_mask = create_inpainting_mask(class_masks, EDITABLE_CLASSES)
-    
-    inpaint_mask_path = args.output.replace(".png", "_inpaint_mask.png")
-    inpaint_mask.save(inpaint_mask_path)
-    print(f"   Inpainting mask saved: {inpaint_mask_path}")
-    
-    print("[4/5] Preparing ControlNet conditioning...")
-    control_image = prepare_controlnet_input(seg_mask)
-    
-    print("[5/5] Generating smart city satellite image...")
-    generator = SmartCitySatelliteGenerator()
-    
-    generated_image = generator.generate_smart_city_image(
-        original_image=original_image,
-        control_image=control_image,
-        inpaint_mask=inpaint_mask,
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance_scale,
-        controlnet_conditioning_scale=args.controlnet_scale,
-        seed=args.seed,
-    )
-    
-    print("\nCompositing with original (preserving immutable regions)...")
-    final_image = composite_with_original(generated_image, original_image, inpaint_mask)
-    
-    # Save outputs
-    final_image.save(args.output)
-    print(f"\n✓ Final image saved: {args.output}")
-    
-    raw_output_path = args.output.replace(".png", "_raw.png")
-    generated_image.save(raw_output_path)
-    print(f"✓ Raw generation saved: {raw_output_path}")
-    
-    # =========================================================================
-    # PART 4: VALIDATION
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("PART 4: VALIDATION")
-    print("=" * 70)
-    
-    validation = validate_and_log_results(
-        mask_path, final_image, coverage, output_dir
-    )
-    
-    print("\n" + "=" * 70)
-    print("    PIPELINE COMPLETE")
-    print("=" * 70)
-    print(f"\nOutputs saved to: {output_dir}/")
-    print(f"  • smart_city_generated.png     - Final composited image")
-    print(f"  • smart_city_generated_raw.png - Raw diffusion output")
-    print(f"  • urban_analysis_report.md     - Analysis and suggestions")
-    print(f"  • validation_results.md        - Validation log")
-    print("=" * 70)
 
 
 if __name__ == "__main__":
