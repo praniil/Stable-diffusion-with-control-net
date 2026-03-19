@@ -13,3 +13,4 @@ accelerate>=0.24.0
 safetensors>=0.4.0
 xformers>=0.0.20
 omegaconf>=2.3.0
+scikit-learn>=1.3.0
